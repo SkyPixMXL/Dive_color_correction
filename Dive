@@ -9,7 +9,7 @@ import cv2
 THRESHOLD_RATIO = 2000
 MIN_AVG_RED = 60
 MAX_HUE_SHIFT = 120
-BLUE_MAGIC_VALUE = 1.2
+BLUE_MAGIC_VALUE = 1.2  # valeur originale
 SAMPLE_SECONDS = 2  # calcule un filtre toutes les N secondes
 
 IMAGE_EXTS = {".jpg",".jpeg",".png",".bmp",".tiff",".tif"}
@@ -33,7 +33,6 @@ def choose_fourcc(test_path, fps, frame_size):
     Essaie plusieurs codecs H.264, sinon fallback mp4v.
     Retourne (fourcc_str, ok)
     """
-    # ordre de préférence
     candidates = ["avc1", "H264", "h264", "mp4v"]
     for cand in candidates:
         fourcc = cv2.VideoWriter_fourcc(*cand)
@@ -49,37 +48,38 @@ def choose_fourcc(test_path, fps, frame_size):
             return cand, True
     return "mp4v", False
 
-# ================== COULEUR / CORRECTION ==================
+# ================== ALGO ORIGINAL (CORRECTION COULEUR) ==================
 def hue_shift_red(mat, h):
+    """Décalage de teinte orienté rouge (algorithme original)."""
     mat = mat.astype(np.float32, copy=False)
     U = math.cos(h * math.pi / 180.0)
     W = math.sin(h * math.pi / 180.0)
     r = (0.299 + 0.701 * U + 0.168 * W) * mat[..., 0]
     g = (0.587 - 0.587 * U + 0.330 * W) * mat[..., 1]
     b = (0.114 - 0.114 * U - 0.497 * W) * mat[..., 2]
-    return np.dstack([r, g, b]).astype(np.float32)
+    return np.dstack([r, g, b])
 
 def normalizing_interval(array):
-    # array peut contenir des zéros -> on récupère indices non nuls
-    arr = np.asarray(array, dtype=np.float32)
-    nz = arr[arr > 0]
-    if nz.size < 2:
-        return 0.0, 255.0
-    nz = np.unique(np.clip(nz, 0, 255))
-    diffs = nz[1:] - nz[:-1]
-    if diffs.size == 0:
-        return float(nz[0]), float(nz[-1])
-    i = int(np.argmax(diffs))
-    low = float(nz[i])
-    high = float(nz[i+1])
-    if high <= low:
-        return 0.0, 255.0
-    return low, high
+    """Version originale : choisit le plus grand saut entre valeurs consécutives."""
+    arr = np.asarray(array).ravel()
+    high = 255.0
+    low = 0.0
+    max_dist = 0.0
+    for i in range(1, len(arr)):
+        dist = float(arr[i] - arr[i-1])
+        if dist > max_dist:
+            max_dist = dist
+            high = float(arr[i])
+            low = float(arr[i-1])
+    return (low, high)
 
 def apply_filter(mat, filt):
+    """Application du filtre (formulation originale)."""
     mat = mat.astype(np.float32, copy=False)
-    r, g, b = mat[..., 0], mat[..., 1], mat[..., 2]
-    # filt est de taille 20
+    r = mat[..., 0]
+    g = mat[..., 1]
+    b = mat[..., 2]
+    # NB : l'algo original ne mixe qu'au niveau du rouge; G et B utilisent un gain propre + offset
     r2 = r * filt[0] + g * filt[1] + b * filt[2] + filt[4] * 255.0
     g2 = g * filt[6] + filt[9] * 255.0
     b2 = b * filt[12] + filt[14] * 255.0
@@ -87,31 +87,36 @@ def apply_filter(mat, filt):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 def get_filter_matrix(mat_rgb):
-    # Travail sur copie réduite pour la robustesse/performances
-    small = cv2.resize(mat_rgb, (256, 256), interpolation=cv2.INTER_AREA).astype(np.float32)
-    avg = np.array(cv2.mean(small)[:3], dtype=np.float32)
-    new_avg_r = float(avg[0])
-    hue_shift = 0
-    # Monte le rouge moyen au minimum requis
-    while new_avg_r < MIN_AVG_RED and hue_shift <= MAX_HUE_SHIFT:
-        shifted = hue_shift_red(avg[np.newaxis, np.newaxis, :], hue_shift)
-        new_avg_r = float(np.sum(shifted))
-        hue_shift += 1
+    """Construction de la matrice de filtre (algorithme original)."""
+    # Travailler sur une version réduite pour robustesse/performances
+    mat = cv2.resize(mat_rgb, (256, 256), interpolation=cv2.INTER_AREA)
 
-    # Applique le décalage de teinte au canal R
-    shifted_mat = hue_shift_red(small, hue_shift)
-    new_r = np.sum(shifted_mat, axis=2)
-    new_r = np.clip(new_r, 0, 255)
-    small[..., 0] = new_r
+    # Moyennes RGB
+    avg_mat = np.array(cv2.mean(mat)[:3], dtype=np.uint8)
+
+    # Cherche un hue_shift tel que la moyenne rouge atteigne MIN_AVG_RED
+    new_avg_r = int(avg_mat[0])
+    hue_shift = 0
+    while new_avg_r < MIN_AVG_RED:
+        shifted = hue_shift_red(avg_mat, hue_shift)
+        new_avg_r = int(np.sum(shifted))
+        hue_shift += 1
+        if hue_shift > MAX_HUE_SHIFT:
+            new_avg_r = MIN_AVG_RED
+
+    # Applique le hue shift et remplace le canal R par la somme des canaux
+    shifted_mat = hue_shift_red(mat, hue_shift)
+    new_r_channel = np.sum(shifted_mat, axis=2)
+    new_r_channel = np.clip(new_r_channel, 0, 255)
+    mat[..., 0] = new_r_channel
 
     # Histogrammes
-    hist_r = cv2.calcHist([small.astype(np.uint8)], [0], None, [256], [0, 256])
-    hist_g = cv2.calcHist([small.astype(np.uint8)], [1], None, [256], [0, 256])
-    hist_b = cv2.calcHist([small.astype(np.uint8)], [2], None, [256], [0, 256])
+    hist_r = cv2.calcHist([mat], [0], None, [256], [0, 256])
+    hist_g = cv2.calcHist([mat], [1], None, [256], [0, 256])
+    hist_b = cv2.calcHist([mat], [2], None, [256], [0, 256])
 
     normalize_mat = np.zeros((256, 3), dtype=np.float32)
-    threshold_level = (small.shape[0] * small.shape[1]) / float(THRESHOLD_RATIO)
-
+    threshold_level = (mat.shape[0] * mat.shape[1]) / float(THRESHOLD_RATIO)
     for x in range(256):
         if hist_r[x] < threshold_level:
             normalize_mat[x, 0] = x
@@ -121,34 +126,36 @@ def get_filter_matrix(mat_rgb):
             normalize_mat[x, 2] = x
     normalize_mat[255] = [255, 255, 255]
 
-    rl, rh = normalizing_interval(normalize_mat[:, 0])
-    gl, gh = normalizing_interval(normalize_mat[:, 1])
-    bl, bh = normalizing_interval(normalize_mat[:, 2])
+    rl, rh = normalizing_interval(normalize_mat[..., 0])
+    gl, gh = normalizing_interval(normalize_mat[..., 1])
+    bl, bh = normalizing_interval(normalize_mat[..., 2])
 
-    shifted_unit = hue_shift_red(np.array([[[1, 1, 1]]], dtype=np.float32), hue_shift)[0, 0]
-    sr, sg, sb = [float(x) for x in shifted_unit]
+    shifted = hue_shift_red(np.array([1, 1, 1], dtype=np.float32), hue_shift)
+    # Dans l'algo original, shifted est 2D; on récupère via indices [0][0]
+    shifted_r, shifted_g, shifted_b = shifted[0][0]
 
-    # Gains (protégés)
-    rg = safe_float(256.0 / max(1e-6, (rh - rl)), 1.0)
-    gg = safe_float(256.0 / max(1e-6, (gh - gl)), 1.0)
-    bg = safe_float(256.0 / max(1e-6, (bh - bl)), 1.0)
+    # Gains (formule originale). ATTENTION: peut être agressif selon les images.
+    red_gain   = 256.0 / max(1.0, (rh - rl))
+    green_gain = 256.0 / max(1.0, (gh - gl))
+    blue_gain  = 256.0 / max(1.0, (bh - bl))
 
-    rOff = (-rl / 256.0) * rg
-    gOff = (-gl / 256.0) * gg
-    bOff = (-bl / 256.0) * bg
+    redOffset   = (-rl / 256.0) * red_gain
+    greenOffset = (-gl / 256.0) * green_gain
+    blueOffset  = (-bl / 256.0) * blue_gain
 
-    adjust_red       = sr * rg
-    adjust_red_green = sg * rg
-    adjust_red_blue  = sb * rg * BLUE_MAGIC_VALUE
+    adjust_red       = shifted_r * red_gain
+    adjust_red_green = shifted_g * red_gain
+    adjust_red_blue  = shifted_b * red_gain * BLUE_MAGIC_VALUE
 
     return np.array([
-        adjust_red, adjust_red_green, adjust_red_blue, 0, rOff,
-        0, gg, 0, 0, gOff,
-        0, 0, bg, 0, bOff,
-        0, 0, 0, 1, 0
+        adjust_red, adjust_red_green, adjust_red_blue, 0, redOffset,
+        0, green_gain, 0, 0, greenOffset,
+        0, 0, blue_gain, 0, blueOffset,
+        0, 0, 0, 1, 0,
     ], dtype=np.float32)
 
 def correct_rgb_to_bgr(mat_bgr):
+    """Prend une image BGR, applique l'algorithme original en RGB, renvoie BGR corrigé."""
     rgb = cv2.cvtColor(mat_bgr, cv2.COLOR_BGR2RGB)
     filt = get_filter_matrix(rgb)
     corrected_rgb = apply_filter(rgb, filt)
@@ -169,7 +176,7 @@ def process_image(path, preview_cb=None):
 
 # ================== TRAITEMENT VIDÉO ==================
 def analyze_video(input_path, fps, frame_count):
-    """Échantillonne des matrices de filtres à intervalle régulier."""
+    """Échantillonne des matrices de filtres (algorithme original) à intervalle régulier."""
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise RuntimeError(f"Impossible d'ouvrir la vidéo : {input_path}")
@@ -183,14 +190,15 @@ def analyze_video(input_path, fps, frame_count):
     while ok:
         count += 1
         if count % step == 0 or count == 1:
-            filt = get_filter_matrix(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            filt = get_filter_matrix(rgb)
             filters.append(filt)
             indices.append(count)
         ok, frame = cap.read()
 
     cap.release()
 
-    # Toujours au moins un filtre (au pire, milieu de la vidéo)
+    # Toujours au moins un filtre
     if not filters:
         mid = max(1, frame_count // 2)
         cap = cv2.VideoCapture(input_path)
@@ -199,7 +207,8 @@ def analyze_video(input_path, fps, frame_count):
         cap.release()
         if not ok:
             raise RuntimeError("Impossible d'échantillonner la vidéo.")
-        filt = get_filter_matrix(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        filt = get_filter_matrix(rgb)
         filters = [filt]
         indices = [mid]
 
@@ -273,10 +282,6 @@ def process_video_with_audio(input_path, progress_cb=None):
     out.release()
 
     # Fusion vidéo corrigée + audio original
-    # -c:v copy : copie la vidéo corrigée telle quelle (pas de ré-encodage)
-    # -c:a aac  : audio ré-encodé proprement si nécessaire
-    # -shortest : s'aligne sur la plus courte piste
-    # -movflags +faststart : meilleur démarrage en streaming/QuickLook
     cmd = [
         "ffmpeg","-y",
         "-i", temp_video,
@@ -404,7 +409,6 @@ class App(tk.Tk):
                     self.after(0, lambda: self.set_progress((i+1)/total_files))
 
                 elif ext in VIDEO_EXTS:
-                    # l’aperçu live vidéo coûteux : on met à jour juste la barre
                     out = process_video_with_audio(path, progress_cb=ui_progress)
                     self.after(0, lambda: self.set_status(f"Vidéo finale (audio conservé) : {out}"))
                 else:
