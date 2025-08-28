@@ -1,12 +1,12 @@
 # Dive_color_correction
 This Python code corrects the predominance of blue in water.
 
-# 1. Clone the repository
+## 1. Clone the repository
 ```bash
 git clone https://github.com/SkyPixMXL/Dive_color_correction.git
 cd Dive_color_correction
 ```
-# 2. Create/activate a virtual environment and install the dependencies
+## 2. Create/activate a virtual environment and install the dependencies
 👉 On Linux / macOS:
 ```bash
 python -m venv dive-env
@@ -20,7 +20,7 @@ python -m venv dive-env
 pip install -r requirements.txt
 ```
 
-# 3. Run your Python file
+## 3. Run your Python file
 ```bash
 python Dive.py
 ```
