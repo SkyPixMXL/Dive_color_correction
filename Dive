@@ -1,425 +1,391 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk, messagebox
 from PIL import Image, ImageTk
-import os, math, threading, shutil, tempfile, subprocess
-import numpy as np
 import cv2
+import numpy as np
+import math
+import threading
+import queue
+import os
 
-# ================== PARAMÈTRES GLOBAUX ==================
-THRESHOLD_RATIO = 2000
-MIN_AVG_RED = 60
-MAX_HUE_SHIFT = 120
-BLUE_MAGIC_VALUE = 1.2  # valeur originale
-SAMPLE_SECONDS = 2  # calcule un filtre toutes les N secondes
+# MoviePy est nécessaire pour le traitement vidéo avec audio
+try:
+    import moviepy.editor as mp
+except ImportError:
+    messagebox.showerror("Dépendance Manquante", "La bibliothèque 'moviepy' est requise pour le traitement vidéo.\n\nVeuillez l'installer en utilisant la commande :\npip install moviepy")
+    exit()
 
-IMAGE_EXTS = {".jpg",".jpeg",".png",".bmp",".tiff",".tif"}
-VIDEO_EXTS = {".mp4",".mov",".mkv",".avi",".m4v"}
+# -----------------------------------------------------------------------------
+# SECTION 1: LOGIQUE DE TRAITEMENT D'IMAGE (Identique à votre code original)
+# -----------------------------------------------------------------------------
+# Ces fonctions sont votre algorithme de base pour la correction des couleurs.
+# Elles sont appelées par l'interface graphique pour traiter les images.
 
-# ================== OUTILS ==================
-def has_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-def safe_float(x, default=1.0):
-    try:
-        x = float(x)
-        if np.isfinite(x) and x != 0:
-            return x
-    except Exception:
-        pass
-    return float(default)
-
-def choose_fourcc(test_path, fps, frame_size):
-    """
-    Essaie plusieurs codecs H.264, sinon fallback mp4v.
-    Retourne (fourcc_str, ok)
-    """
-    candidates = ["avc1", "H264", "h264", "mp4v"]
-    for cand in candidates:
-        fourcc = cv2.VideoWriter_fourcc(*cand)
-        vw = cv2.VideoWriter(test_path, fourcc, max(1.0, fps), frame_size)
-        ok = vw.isOpened()
-        vw.release()
-        if ok:
-            try:
-                if os.path.exists(test_path):
-                    os.remove(test_path)
-            except Exception:
-                pass
-            return cand, True
-    return "mp4v", False
-
-# ================== ALGO ORIGINAL (CORRECTION COULEUR) ==================
 def hue_shift_red(mat, h):
-    """Décalage de teinte orienté rouge (algorithme original)."""
-    mat = mat.astype(np.float32, copy=False)
-    U = math.cos(h * math.pi / 180.0)
-    W = math.sin(h * math.pi / 180.0)
+    U = math.cos(h * math.pi / 180)
+    W = math.sin(h * math.pi / 180)
     r = (0.299 + 0.701 * U + 0.168 * W) * mat[..., 0]
     g = (0.587 - 0.587 * U + 0.330 * W) * mat[..., 1]
     b = (0.114 - 0.114 * U - 0.497 * W) * mat[..., 2]
     return np.dstack([r, g, b])
 
 def normalizing_interval(array):
-    """Version originale : choisit le plus grand saut entre valeurs consécutives."""
-    arr = np.asarray(array).ravel()
-    high = 255.0
-    low = 0.0
-    max_dist = 0.0
-    for i in range(1, len(arr)):
-        dist = float(arr[i] - arr[i-1])
+    high, low, max_dist = 255, 0, 0
+    for i in range(1, len(array)):
+        dist = array[i] - array[i-1]
         if dist > max_dist:
-            max_dist = dist
-            high = float(arr[i])
-            low = float(arr[i-1])
+            max_dist, high, low = dist, array[i], array[i-1]
     return (low, high)
 
 def apply_filter(mat, filt):
-    """Application du filtre (formulation originale)."""
-    mat = mat.astype(np.float32, copy=False)
-    r = mat[..., 0]
-    g = mat[..., 1]
-    b = mat[..., 2]
-    # NB : l'algo original ne mixe qu'au niveau du rouge; G et B utilisent un gain propre + offset
-    r2 = r * filt[0] + g * filt[1] + b * filt[2] + filt[4] * 255.0
-    g2 = g * filt[6] + filt[9] * 255.0
-    b2 = b * filt[12] + filt[14] * 255.0
-    out = np.dstack([r2, g2, b2])
-    return np.clip(out, 0, 255).astype(np.uint8)
+    r = mat[..., 0] * filt[0] + mat[..., 1] * filt[1] + mat[..., 2] * filt[2] + filt[4] * 255
+    g = mat[..., 1] * filt[6] + filt[9] * 255
+    b = mat[..., 2] * filt[12] + filt[14] * 255
+    filtered_mat = np.dstack([r, g, b])
+    return np.clip(filtered_mat, 0, 255).astype(np.uint8)
 
-def get_filter_matrix(mat_rgb):
-    """Construction de la matrice de filtre (algorithme original)."""
-    # Travailler sur une version réduite pour robustesse/performances
-    mat = cv2.resize(mat_rgb, (256, 256), interpolation=cv2.INTER_AREA)
-
-    # Moyennes RGB
+def get_filter_matrix(mat, params):
+    mat = cv2.resize(mat, (256, 256))
     avg_mat = np.array(cv2.mean(mat)[:3], dtype=np.uint8)
-
-    # Cherche un hue_shift tel que la moyenne rouge atteigne MIN_AVG_RED
-    new_avg_r = int(avg_mat[0])
-    hue_shift = 0
-    while new_avg_r < MIN_AVG_RED:
+    new_avg_r, hue_shift = avg_mat[0], 0
+    while new_avg_r < params['MIN_AVG_RED']:
         shifted = hue_shift_red(avg_mat, hue_shift)
-        new_avg_r = int(np.sum(shifted))
+        new_avg_r = np.sum(shifted)
         hue_shift += 1
-        if hue_shift > MAX_HUE_SHIFT:
-            new_avg_r = MIN_AVG_RED
-
-    # Applique le hue shift et remplace le canal R par la somme des canaux
+        if hue_shift > params['MAX_HUE_SHIFT']:
+            new_avg_r = params['MIN_AVG_RED']
+    
     shifted_mat = hue_shift_red(mat, hue_shift)
-    new_r_channel = np.sum(shifted_mat, axis=2)
-    new_r_channel = np.clip(new_r_channel, 0, 255)
+    new_r_channel = np.clip(np.sum(shifted_mat, axis=2), 0, 255)
     mat[..., 0] = new_r_channel
 
-    # Histogrammes
     hist_r = cv2.calcHist([mat], [0], None, [256], [0, 256])
     hist_g = cv2.calcHist([mat], [1], None, [256], [0, 256])
     hist_b = cv2.calcHist([mat], [2], None, [256], [0, 256])
 
-    normalize_mat = np.zeros((256, 3), dtype=np.float32)
-    threshold_level = (mat.shape[0] * mat.shape[1]) / float(THRESHOLD_RATIO)
+    normalize_mat = np.zeros((256, 3))
+    threshold_level = (mat.shape[0] * mat.shape[1]) / params['THRESHOLD_RATIO']
     for x in range(256):
-        if hist_r[x] < threshold_level:
-            normalize_mat[x, 0] = x
-        if hist_g[x] < threshold_level:
-            normalize_mat[x, 1] = x
-        if hist_b[x] < threshold_level:
-            normalize_mat[x, 2] = x
+        if hist_r[x] < threshold_level: normalize_mat[x][0] = x
+        if hist_g[x] < threshold_level: normalize_mat[x][1] = x
+        if hist_b[x] < threshold_level: normalize_mat[x][2] = x
     normalize_mat[255] = [255, 255, 255]
 
-    rl, rh = normalizing_interval(normalize_mat[..., 0])
-    gl, gh = normalizing_interval(normalize_mat[..., 1])
-    bl, bh = normalizing_interval(normalize_mat[..., 2])
+    adjust_r_low, adjust_r_high = normalizing_interval(normalize_mat[..., 0])
+    adjust_g_low, adjust_g_high = normalizing_interval(normalize_mat[..., 1])
+    adjust_b_low, adjust_b_high = normalizing_interval(normalize_mat[..., 2])
 
-    shifted = hue_shift_red(np.array([1, 1, 1], dtype=np.float32), hue_shift)
-    # Dans l'algo original, shifted est 2D; on récupère via indices [0][0]
-    shifted_r, shifted_g, shifted_b = shifted[0][0]
+    shifted_r, shifted_g, shifted_b = hue_shift_red(np.array([1, 1, 1]), hue_shift)[0][0]
 
-    # Gains (formule originale). ATTENTION: peut être agressif selon les images.
-    red_gain   = 256.0 / max(1.0, (rh - rl))
-    green_gain = 256.0 / max(1.0, (gh - gl))
-    blue_gain  = 256.0 / max(1.0, (bh - bl))
+    red_gain = 256 / (adjust_r_high - adjust_r_low) if (adjust_r_high - adjust_r_low) != 0 else 0
+    green_gain = 256 / (adjust_g_high - adjust_g_low) if (adjust_g_high - adjust_g_low) != 0 else 0
+    blue_gain = 256 / (adjust_b_high - adjust_b_low) if (adjust_b_high - adjust_b_low) != 0 else 0
 
-    redOffset   = (-rl / 256.0) * red_gain
-    greenOffset = (-gl / 256.0) * green_gain
-    blueOffset  = (-bl / 256.0) * blue_gain
+    redOffset = (-adjust_r_low / 256) * red_gain
+    greenOffset = (-adjust_g_low / 256) * green_gain
+    blueOffset = (-adjust_b_low / 256) * blue_gain
 
-    adjust_red       = shifted_r * red_gain
+    adjust_red = shifted_r * red_gain
     adjust_red_green = shifted_g * red_gain
-    adjust_red_blue  = shifted_b * red_gain * BLUE_MAGIC_VALUE
+    adjust_red_blue = shifted_b * red_gain * params['BLUE_MAGIC_VALUE']
 
     return np.array([
         adjust_red, adjust_red_green, adjust_red_blue, 0, redOffset,
         0, green_gain, 0, 0, greenOffset,
         0, 0, blue_gain, 0, blueOffset,
         0, 0, 0, 1, 0,
-    ], dtype=np.float32)
+    ])
 
-def correct_rgb_to_bgr(mat_bgr):
-    """Prend une image BGR, applique l'algorithme original en RGB, renvoie BGR corrigé."""
-    rgb = cv2.cvtColor(mat_bgr, cv2.COLOR_BGR2RGB)
-    filt = get_filter_matrix(rgb)
-    corrected_rgb = apply_filter(rgb, filt)
-    return cv2.cvtColor(corrected_rgb, cv2.COLOR_RGB2BGR)
+# -----------------------------------------------------------------------------
+# SECTION 2: CLASSE PRINCIPALE DE L'APPLICATION TKINTER
+# -----------------------------------------------------------------------------
 
-# ================== TRAITEMENT IMAGES ==================
-def process_image(path, preview_cb=None):
-    base, ext = os.path.splitext(path)
-    out_path = f"{base}_T{ext}"
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is None:
-        raise RuntimeError(f"Impossible de lire l'image : {path}")
-    corrected = correct_rgb_to_bgr(img)
-    cv2.imwrite(out_path, corrected)
-    if preview_cb:
-        preview_cb(corrected)
-    return out_path
-
-# ================== TRAITEMENT VIDÉO ==================
-def analyze_video(input_path, fps, frame_count):
-    """Échantillonne des matrices de filtres (algorithme original) à intervalle régulier."""
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Impossible d'ouvrir la vidéo : {input_path}")
-
-    step = max(1, int(round(fps * SAMPLE_SECONDS)))
-    filters = []
-    indices = []
-
-    count = 0
-    ok, frame = cap.read()
-    while ok:
-        count += 1
-        if count % step == 0 or count == 1:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            filt = get_filter_matrix(rgb)
-            filters.append(filt)
-            indices.append(count)
-        ok, frame = cap.read()
-
-    cap.release()
-
-    # Toujours au moins un filtre
-    if not filters:
-        mid = max(1, frame_count // 2)
-        cap = cv2.VideoCapture(input_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, mid-1)
-        ok, frame = cap.read()
-        cap.release()
-        if not ok:
-            raise RuntimeError("Impossible d'échantillonner la vidéo.")
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        filt = get_filter_matrix(rgb)
-        filters = [filt]
-        indices = [mid]
-
-    filters = np.asarray(filters, dtype=np.float32)  # shape: (N, 20)
-    indices = np.asarray(indices, dtype=np.float32)
-    return filters, indices
-
-def process_video_with_audio(input_path, progress_cb=None):
-    """
-    1) Corrige la vidéo frame par frame → temp mp4 (sans audio)
-    2) Fusionne l'audio de la vidéo originale via FFmpeg → *_T.mp4
-    3) Nettoie les fichiers temporaires
-    """
-    if not has_ffmpeg():
-        raise RuntimeError("FFmpeg est requis pour l'audio (installe-le : brew install ffmpeg)")
-
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Impossible d'ouvrir la vidéo : {input_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not np.isfinite(fps) or fps <= 0:
-        fps = 25.0  # fallback raisonnable
-
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    base, _ = os.path.splitext(input_path)
-    final_out = f"{base}_T.mp4"
-
-    # Fichier temporaire vidéo (corrigée, sans audio)
-    tmp_dir = tempfile.mkdtemp(prefix="colfix_")
-    temp_video = os.path.join(tmp_dir, "video_no_audio.mp4")
-
-    # Choix du codec compatible
-    test_path = os.path.join(tmp_dir, "probe.mp4")
-    codec, _ = choose_fourcc(test_path, fps, (width, height))
-    fourcc = cv2.VideoWriter_fourcc(*codec)
-    out = cv2.VideoWriter(temp_video, fourcc, float(fps), (width, height))
-    if not out.isOpened():
-        raise RuntimeError("Échec de l'ouverture du VideoWriter (codec non supporté).")
-
-    # Préparer filtres (interpolation)
-    filters, indices = analyze_video(input_path, fps, total)
-    F = filters.shape[0]
-    L = filters.shape[1]  # 20
-
-    def interp_filter(n):
-        # Interpolation 1D sur chaque coefficient
-        vals = [np.interp(n, indices, filters[:, k]) for k in range(L)]
-        return np.asarray(vals, dtype=np.float32)
-
-    # Parcours des frames
-    idx = 0
-    ok, frame = cap.read()
-    while ok:
-        idx += 1
-        fmat = interp_filter(idx) if F >= 2 else filters[0]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        corrected = apply_filter(rgb, fmat)
-        corrected_bgr = cv2.cvtColor(corrected, cv2.COLOR_RGB2BGR)
-        out.write(corrected_bgr)
-
-        if progress_cb and total > 0:
-            progress_cb(idx / total)
-
-        ok, frame = cap.read()
-
-    cap.release()
-    out.release()
-
-    # Fusion vidéo corrigée + audio original
-    cmd = [
-        "ffmpeg","-y",
-        "-i", temp_video,
-        "-i", input_path,
-        "-map","0:v:0",
-        "-map","1:a:0",
-        "-c:v","copy",
-        "-c:a","aac",
-        "-movflags","+faststart",
-        "-shortest",
-        final_out
-    ]
-
-    # Si la vidéo source n'a pas d'audio, on ne mappe pas l'audio
-    probe = subprocess.run(
-        ["ffmpeg","-v","error","-i", input_path, "-map","0:a:0","-f","null","-"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    if probe.returncode != 0:
-        # Pas d'audio détecté -> on sort juste la vidéo corrigée
-        cmd = [
-            "ffmpeg","-y",
-            "-i", temp_video,
-            "-c:v","copy",
-            "-movflags","+faststart",
-            final_out
-        ]
-
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-
-    # Nettoyage
-    try:
-        shutil.rmtree(tmp_dir)
-    except Exception:
-        pass
-
-    return final_out
-
-# ================== GUI ==================
-class App(tk.Tk):
+class DivingMediaCorrector(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Correction couleur (avec audio)")
-        self.geometry("720x560")
+        self.title("Correcteur Média Sous-Marin (Tkinter)")
+        self.geometry("1200x800")
 
-        frm = tk.Frame(self)
-        frm.pack(padx=10, pady=10, fill="both", expand=True)
+        # Variables d'état
+        self.original_mat_bgr = None
+        self.corrected_mat_bgr = None
+        self.is_video = False
+        self.current_filepath = None
+        self.loaded_files = [] 
+        self.preview_photo = None
 
-        self.btn_browse = tk.Button(frm, text="Sélectionner fichiers", command=self.browse_files)
-        self.btn_browse.pack(fill=tk.X)
+        self.default_params = {
+            'THRESHOLD_RATIO': 2000,
+            'MIN_AVG_RED': 60,
+            'MAX_HUE_SHIFT': 120,
+            'BLUE_MAGIC_VALUE': 1.2
+        }
 
-        self.listbox = tk.Listbox(frm, width=100, height=12, selectmode=tk.MULTIPLE)
-        self.listbox.pack(pady=8, fill="both", expand=True)
+        self.thread_queue = queue.Queue()
+        self.create_widgets()
+        self.after(100, self.check_thread_queue)
 
-        self.preview_label = tk.Label(frm, relief="groove", height=12)
-        self.preview_label.pack(fill=tk.BOTH, pady=6)
+    def create_widgets(self):
+        main_frame = ttk.Frame(self, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.grid_rowconfigure(1, weight=1)
+        main_frame.grid_columnconfigure(0, weight=1)
 
-        self.progress_var = tk.DoubleVar(value=0)
-        self.progress = ttk.Progressbar(frm, variable=self.progress_var, maximum=100)
-        self.progress.pack(fill=tk.X, pady=6)
+        files_frame = ttk.LabelFrame(main_frame, text="Galerie de Fichiers", padding="5")
+        files_frame.grid(row=0, column=0, sticky="ew", pady=5)
+        files_frame.grid_columnconfigure(0, weight=1)
 
-        self.status = tk.StringVar(value="Prêt.")
-        tk.Label(frm, textvariable=self.status, anchor="w").pack(fill=tk.X)
+        list_frame = ttk.Frame(files_frame)
+        list_frame.grid(row=0, column=0, sticky="ew")
+        list_frame.grid_columnconfigure(0, weight=1)
+        
+        self.file_listbox = tk.Listbox(list_frame, height=5)
+        self.file_listbox.grid(row=0, column=0, sticky="ew")
+        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.file_listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.file_listbox['yscrollcommand'] = scrollbar.set
 
-        self.btn_start = tk.Button(frm, text="Lancer correction", command=self.start_thread)
-        self.btn_start.pack(fill=tk.X, pady=4)
+        buttons_frame = ttk.Frame(files_frame)
+        buttons_frame.grid(row=1, column=0, sticky="ew")
+        
+        add_button = ttk.Button(buttons_frame, text="Ajouter des Fichiers...", command=self.add_files)
+        add_button.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        clear_button = ttk.Button(buttons_frame, text="Vider la Liste", command=self.clear_file_list)
+        clear_button.pack(side=tk.LEFT, padx=5, pady=5)
 
-    def browse_files(self):
-        files = filedialog.askopenfilenames(
-            title="Sélectionner des images/vidéos",
-            filetypes=[("Images et vidéos","*.jpg *.jpeg *.png *.bmp *.tiff *.tif *.mp4 *.mov *.mkv *.avi *.m4v")]
-        )
-        self.listbox.delete(0, tk.END)
-        for p in files:
-            self.listbox.insert(tk.END, p)
+        center_frame = ttk.Frame(main_frame)
+        center_frame.grid(row=1, column=0, sticky="nsew", pady=5)
+        center_frame.grid_columnconfigure(0, weight=3)
+        center_frame.grid_columnconfigure(1, weight=1)
+        center_frame.grid_rowconfigure(0, weight=1)
 
-    # Mises à jour thread-safe
-    def set_status(self, text):
-        self.status.set(text)
-        self.update_idletasks()
+        self.image_label = ttk.Label(center_frame, text="L'aperçu apparaîtra ici", anchor=tk.CENTER, background="gray")
+        self.image_label.grid(row=0, column=0, sticky="nsew", padx=5)
 
-    def set_progress(self, frac):
-        self.progress_var.set(max(0, min(100, float(frac)*100.0)))
-        self.update_idletasks()
+        params_frame = ttk.LabelFrame(center_frame, text="Paramètres du Filtre", padding="10")
+        params_frame.grid(row=0, column=1, sticky="nsew", padx=5)
+        self.create_param_sliders(params_frame)
 
-    def show_preview(self, bgr_img):
-        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-        im = Image.fromarray(rgb)
-        im.thumbnail((480, 320))
-        imgtk = ImageTk.PhotoImage(im)
-        self.preview_label.configure(image=imgtk)
-        self.preview_label.image = imgtk
+        bottom_frame = ttk.Frame(main_frame)
+        bottom_frame.grid(row=2, column=0, sticky="ew", pady=5)
 
-    def start_thread(self):
-        if self.listbox.size() == 0:
-            messagebox.showwarning("Aucune sélection", "Sélectionne au moins un fichier.")
-            return
-        t = threading.Thread(target=self.run_all, daemon=True)
-        self.btn_start.config(state="disabled")
-        self.set_progress(0)
-        t.start()
+        self.status_label = ttk.Label(bottom_frame, text="Prêt")
+        self.status_label.pack(side=tk.LEFT, padx=5)
+        
+        self.progress_bar = ttk.Progressbar(bottom_frame, orient='horizontal', mode='determinate')
+        self.progress_bar.pack(fill=tk.X, expand=True, padx=5)
 
-    def run_all(self):
-        # Filtrage et traitement
-        if not has_ffmpeg():
-            self.after(0, lambda: messagebox.showwarning(
-                "FFmpeg manquant",
-                "FFmpeg est requis pour l'audio.\nInstalle-le avec : brew install ffmpeg"
-            ))
+    def create_param_sliders(self, parent_frame):
+        self.params = {key: tk.DoubleVar(value=val) for key, val in self.default_params.items()}
+        
+        def create_slider(label, key, from_, to):
+            ttk.Label(parent_frame, text=label).pack(fill=tk.X, pady=(10, 0))
+            slider = ttk.Scale(parent_frame, from_=from_, to=to, variable=self.params[key], orient='horizontal', command=lambda e: self.update_preview())
+            slider.pack(fill=tk.X)
+        
+        create_slider("Ratio Seuil", 'THRESHOLD_RATIO', 500, 5000)
+        create_slider("Rouge Moyen Min", 'MIN_AVG_RED', 30, 100)
+        create_slider("Décalage Teinte Max", 'MAX_HUE_SHIFT', 50, 200)
+        create_slider("Magie Bleue", 'BLUE_MAGIC_VALUE', 0.5, 2.0)
 
-        total_files = self.listbox.size()
-        for i in range(total_files):
-            path = self.listbox.get(i)
-            ext = os.path.splitext(path)[1].lower()
+        self.save_button = ttk.Button(parent_frame, text="Enregistrer l'Image Corrigée", command=self.save_image, state=tk.DISABLED)
+        self.save_button.pack(side=tk.LEFT, pady=20, expand=True)
 
-            def ui_progress(frac):
-                self.after(0, lambda f=frac: self.set_progress( (i + f) / total_files ))
+        reset_button = ttk.Button(parent_frame, text="Réinitialiser", command=self.reset_parameters)
+        reset_button.pack(side=tk.RIGHT, pady=20, expand=True)
 
-            self.after(0, lambda p=path: self.set_status(f"Traitement : {p}"))
+    def add_files(self):
+        filepaths = filedialog.askopenfilenames(filetypes=[("Fichiers Média", "*.jpg *.jpeg *.png *.mp4 *.mov *.avi")])
+        if not filepaths: return
+        
+        for fp in filepaths:
+            if fp not in self.loaded_files:
+                self.loaded_files.append(fp)
+                self.file_listbox.insert(tk.END, os.path.basename(fp))
+        
+        if self.file_listbox.curselection() == ():
+            self.file_listbox.selection_set(0)
+            self.on_file_select(None)
 
-            try:
-                if ext in IMAGE_EXTS:
-                    out = process_image(path, preview_cb=lambda img: self.after(0, lambda: self.show_preview(img)))
-                    self.after(0, lambda: self.set_status(f"Image corrigée : {out}"))
-                    self.after(0, lambda: self.set_progress((i+1)/total_files))
+    def clear_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        self.loaded_files.clear()
+        self.original_mat_bgr = None
+        self.corrected_mat_bgr = None
+        self.current_filepath = None
+        self.image_label.config(image='', text="L'aperçu apparaîtra ici")
+        self.save_button.config(state=tk.DISABLED)
+        self.status_label.config(text="Prêt")
+        self.progress_bar['value'] = 0
 
-                elif ext in VIDEO_EXTS:
-                    out = process_video_with_audio(path, progress_cb=ui_progress)
-                    self.after(0, lambda: self.set_status(f"Vidéo finale (audio conservé) : {out}"))
-                else:
-                    self.after(0, lambda: self.set_status(f"Format non supporté : {path}"))
+    def on_file_select(self, event):
+        selection_indices = self.file_listbox.curselection()
+        if not selection_indices: return
+        
+        selected_index = selection_indices[0]
+        self.current_filepath = self.loaded_files[selected_index]
+        self.is_video = any(self.current_filepath.lower().endswith(ext) for ext in ['.mp4', '.mov', '.avi'])
 
-            except Exception as e:
-                self.after(0, lambda: self.set_status(f"Erreur: {e}"))
+        if self.is_video:
+            self.save_button.config(state=tk.DISABLED)
+            cap = cv2.VideoCapture(self.current_filepath)
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                self.original_mat_bgr = frame
+                self.update_preview()
+                self.process_video()
+            else:
+                messagebox.showerror("Erreur", "Impossible de lire la première image de la vidéo.")
+        else:
+            self.original_mat_bgr = cv2.imread(self.current_filepath)
+            if self.original_mat_bgr is not None:
+                self.save_button.config(state=tk.NORMAL)
+                self.update_preview()
+            else:
+                messagebox.showerror("Erreur", "Impossible de charger le fichier image.")
 
-        self.after(0, lambda: self.set_progress(1.0))
-        self.after(0, lambda: messagebox.showinfo("Terminé", "Correction terminée pour tous les fichiers."))
-        self.after(0, lambda: self.btn_start.config(state="normal"))
+    def update_preview(self):
+        if self.original_mat_bgr is None: return
+
+        current_params = {key: var.get() for key, var in self.params.items()}
+        rgb_mat = cv2.cvtColor(self.original_mat_bgr, cv2.COLOR_BGR2RGB)
+        filter_matrix = get_filter_matrix(rgb_mat, current_params)
+        corrected_mat_rgb = apply_filter(rgb_mat, filter_matrix)
+        self.corrected_mat_bgr = cv2.cvtColor(corrected_mat_rgb, cv2.COLOR_RGB2BGR)
+
+        preview_bgr = self.original_mat_bgr.copy()
+        width = preview_bgr.shape[1] // 2
+        preview_bgr[:, width:] = self.corrected_mat_bgr[:, width:]
+
+        h, w = preview_bgr.shape[:2]
+        max_h, max_w = self.image_label.winfo_height(), self.image_label.winfo_width()
+        if max_h < 2 or max_w < 2: max_h, max_w = 540, 960
+        scale = min(max_w / w, max_h / h) if w > 0 and h > 0 else 1
+        new_w, new_h = int(w * scale), int(h * scale)
+        
+        resized_preview = cv2.resize(preview_bgr, (new_w, new_h))
+        img = cv2.cvtColor(resized_preview, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(img)
+        self.preview_photo = ImageTk.PhotoImage(image=img_pil)
+        self.image_label.config(image=self.preview_photo)
+
+    def reset_parameters(self):
+        for key, value in self.default_params.items():
+            self.params[key].set(value)
+        self.update_preview()
+
+    def save_image(self):
+        if self.corrected_mat_bgr is None or self.is_video: return
+        save_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("Image PNG", "*.png"), ("Image JPEG", "*.jpg")])
+        if save_path:
+            cv2.imwrite(save_path, self.corrected_mat_bgr)
+            messagebox.showinfo("Succès", f"Image enregistrée sous {os.path.basename(save_path)}")
+
+    def process_video(self):
+        output_path = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("Vidéo MP4", "*.mp4")])
+        if not output_path: return
+        
+        current_params = {key: var.get() for key, var in self.params.items()}
+        current_params['SAMPLE_SECONDS'] = 2
+        
+        thread = threading.Thread(target=self.video_processing_thread, args=(self.current_filepath, output_path, current_params), daemon=True)
+        thread.start()
+
+    def video_processing_thread(self, input_path, output_path, params):
+        try:
+            # --- Phase 1: Analyse avec OpenCV (rapide) ---
+            self.thread_queue.put(('status', f'Analyse de {os.path.basename(input_path)}...'))
+            cap = cv2.VideoCapture(input_path)
+            fps = math.ceil(cap.get(cv2.CAP_PROP_FPS))
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            filter_matrices, filter_indices, count = [], [], 0
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret: break
+                count += 1
+                self.thread_queue.put(('progress', (count, frame_count)))
+                if count % (fps * params['SAMPLE_SECONDS']) == 0:
+                    mat = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    filter_indices.append(count)
+                    filter_matrices.append(get_filter_matrix(mat, params))
+            cap.release()
+            if not filter_matrices:
+                 self.thread_queue.put(('error', 'Vidéo trop courte ou erreur de lecture.'))
+                 return
+
+            # --- Phase 2: Traitement avec MoviePy (conserve l'audio) ---
+            self.thread_queue.put(('status', f'Correction et encodage de {os.path.basename(input_path)}... Patientez.'))
+            self.thread_queue.put(('indeterminate_start', None))
+
+            clip = mp.VideoFileClip(input_path)
+            
+            filter_matrices_np = np.array(filter_matrices)
+            filter_indices_np = np.array(filter_indices)
+            
+            def get_interpolated_filter_matrix(frame_num):
+                if frame_num <= filter_indices_np[0]: return filter_matrices_np[0]
+                if frame_num >= filter_indices_np[-1]: return filter_matrices_np[-1]
+                return [np.interp(frame_num, filter_indices_np, filter_matrices_np[..., x]) for x in range(len(filter_matrices_np[0]))]
+
+            def transform_frame(frame_at_t, t):
+                frame_num = int(t * clip.fps)
+                interpolated_filter = get_interpolated_filter_matrix(frame_num)
+                # MoviePy utilise des frames RGB, ce qui est attendu par apply_filter
+                return apply_filter(frame_at_t, interpolated_filter)
+
+            processed_clip = clip.fl(lambda gf, t: transform_frame(gf(t), t))
+            
+            # Réassigner l'audio original au clip traité
+            if clip.audio:
+                processed_clip.audio = clip.audio
+            
+            processed_clip.write_videofile(output_path, codec='libx264', audio_codec='aac', temp_audiofile='temp-audio.m4a', remove_temp=True)
+            
+            clip.close()
+            processed_clip.close()
+            
+            self.thread_queue.put(('done', f'Terminé ! Vidéo enregistrée sous {os.path.basename(output_path)}'))
+        except Exception as e:
+            self.thread_queue.put(('error', f'Erreur lors du traitement : {e}'))
+
+    def check_thread_queue(self):
+        try:
+            message = self.thread_queue.get(block=False)
+            msg_type, data = message
+
+            if msg_type == 'status':
+                self.status_label.config(text=data)
+            elif msg_type == 'progress':
+                current, total = data
+                self.progress_bar.config(mode='determinate')
+                self.progress_bar['maximum'] = total
+                self.progress_bar['value'] = current
+            elif msg_type == 'indeterminate_start':
+                self.progress_bar.config(mode='indeterminate')
+                self.progress_bar.start(10)
+            elif msg_type == 'done':
+                self.progress_bar.stop()
+                self.progress_bar.config(mode='determinate')
+                self.status_label.config(text="Prêt")
+                self.progress_bar['value'] = 0
+                messagebox.showinfo("Succès", data)
+            elif msg_type == 'error':
+                self.progress_bar.stop()
+                self.progress_bar.config(mode='determinate')
+                self.status_label.config(text="Erreur")
+                self.progress_bar['value'] = 0
+                messagebox.showerror("Erreur", data)
+
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self.check_thread_queue)
 
 if __name__ == "__main__":
-    App().mainloop()
+    app = DivingMediaCorrector()
+    app.mainloop()
