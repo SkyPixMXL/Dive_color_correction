@@ -2,6 +2,7 @@
 This Python code corrects the predominance of blue in water.
 
 # 1. Clone the repository
+```bash
 git clone https://github.com/SkyPixMXL/Dive_color_correction.git
 
 # 2. Go into the project folder
