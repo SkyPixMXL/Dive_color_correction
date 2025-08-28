@@ -16,7 +16,7 @@ except ImportError:
     exit()
 
 # -----------------------------------------------------------------------------
-# SECTION 1: LOGIQUE DE TRAITEMENT D'IMAGE (Identique à votre code original)
+# SECTION 1: LOGIQUE DE TRAITEMENT D'IMAGE
 # -----------------------------------------------------------------------------
 # Ces fonctions sont votre algorithme de base pour la correction des couleurs.
 # Elles sont appelées par l'interface graphique pour traiter les images.
