@@ -26,4 +26,4 @@ python Dive.py
 ```
 
 ### Inspiration
-##### This repo was inspired by the algorithm at https://github.com/nikolajbech/underwater-image-color-correction.
+##### This repo was inspired by the algorithm at https://github.com/bornfree/dive-color-corrector.
