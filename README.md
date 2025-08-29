@@ -25,5 +25,5 @@ pip install -r requirements.txt
 python Dive.py
 ```
 
-###Inspiration
-####This repo was inspired by the algorithm at https://github.com/nikolajbech/underwater-image-color-correction.
+### Inspiration
+#### This repo was inspired by the algorithm at https://github.com/nikolajbech/underwater-image-color-correction.
